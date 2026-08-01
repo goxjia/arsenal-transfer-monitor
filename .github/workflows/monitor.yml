@@ -7,7 +7,16 @@ on:
     # 请把下面改成 '*/30 * * * *'（30 分钟，约 1440 分钟/月，安全在额度内）。
     # 公开(public)仓库定时任务无限时长，保持 15 分钟即可。
     - cron: '*/15 * * * *'
-  workflow_dispatch: {}   # 允许在 Actions 页面手动触发测试
+  workflow_dispatch:      # 允许在 Actions 页面手动触发（可选测试模式）
+    inputs:
+      test_mode:
+        description: '测试模式：绕过静默时段、忽略去重，推送近 N 天匹配内容'
+        type: boolean
+        default: false
+      backfill_days:
+        description: '测试模式回溯天数（默认 7）'
+        type: number
+        default: 7
 
 permissions:
   contents: read
@@ -41,6 +50,10 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           BARK_KEY: ${{ secrets.BARK_KEY }}
           BARK_SERVER: ${{ secrets.BARK_SERVER }}   # 可选，默认 https://api.day.app
+          QUIET_START: ${{ secrets.QUIET_START }}    # 可选，默认 23:30（北京时间）
+          QUIET_END: ${{ secrets.QUIET_END }}        # 可选，默认 08:00（北京时间）
+          TEST_MODE: ${{ github.event.inputs.test_mode && '1' || '' }}
+          BACKFILL_DAYS: ${{ github.event.inputs.backfill_days }}
         run: python monitor.py
 
       - name: Upload state artifact

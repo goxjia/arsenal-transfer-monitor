@@ -9,6 +9,10 @@ Arsenal 转会新闻监控
 过滤：只推送含 Arsenal 关键词的内容
 推送：Bark -> iPhone (免费, 国内可达, 免代理)
 
+特性：
+  - 静默时段：北京时间 23:30 - 次日 08:00 不推送，消息进入待推送队列，时段结束后统一补推。
+  - 测试模式：TEST_MODE=1 时绕过静默时段、忽略去重，推送近 N 天（默认 7）匹配消息，用于验证管道。
+
 部署：GitHub Actions 定时运行（美国节点直连 TG API 与 Bark 服务器，全程免代理）。
 依赖：仅 requests（HTML 解析用标准库）。
 """
@@ -17,6 +21,7 @@ import os
 import re
 import json
 import sys
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from html.parser import HTMLParser
 
@@ -39,6 +44,17 @@ ATHLETIC_FEED_URL = "https://www.theathletic.com/author/david-ornstein/feed/"
 # Arsenal 过滤关键词（大小写不敏感）
 ARSENAL_KEYWORDS = ["arsenal", "#afc", "gunners", "the gunners"]
 
+# 静默时段（北京时间，可经 Secret QUIET_START / QUIET_END 覆盖）
+QUIET_START = os.environ.get("QUIET_START") or "23:30"
+QUIET_END = os.environ.get("QUIET_END") or "08:00"
+
+# 测试模式单次最多推送条数（防刷屏）
+TEST_MAX = int(os.environ.get("TEST_MAX", "30"))
+# 正常模式单次最多推送条数
+PUSH_CAP = int(os.environ.get("PUSH_CAP", "30"))
+# 待推送队列上限
+PENDING_CAP = int(os.environ.get("PENDING_CAP", "80"))
+
 STATE_FILE = Path(os.environ.get("STATE_PATH", "state.json"))
 UA = {
     "User-Agent": (
@@ -54,7 +70,31 @@ URL_RE = re.compile(r"https?://[^\s)]+")
 
 
 # ---------------------------------------------------------------------------
-# 状态（去重）持久化
+# 时间 / 静默时段
+# ---------------------------------------------------------------------------
+def parse_hhmm(s: str) -> int:
+    """'23:30' -> 1410 (分钟)"""
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def beijing_now() -> datetime:
+    return datetime.now(timezone(timedelta(hours=8)))
+
+
+def in_quiet_hours(now_bj: datetime) -> bool:
+    """北京时间是否处于静默时段（支持跨午夜，如 23:30 -> 08:00）。"""
+    start = parse_hhmm(QUIET_START)
+    end = parse_hhmm(QUIET_END)
+    cur = now_bj.hour * 60 + now_bj.minute
+    if start <= end:  # 同日区间，如 22:00-23:00
+        return start <= cur < end
+    # 跨午夜，如 23:30 - 08:00
+    return cur >= start or cur < end
+
+
+# ---------------------------------------------------------------------------
+# 状态（去重 + 待推送队列）持久化
 # ---------------------------------------------------------------------------
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -62,7 +102,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"seen": [], "tg_offset": None}
+    return {"seen": [], "tg_offset": None, "pending": []}
 
 
 def save_state(state: dict) -> None:
@@ -84,6 +124,27 @@ def is_arsenal(text: str) -> bool:
 def extract_url(text: str):
     m = URL_RE.search(text or "")
     return m.group(0) if m else None
+
+
+def athletic_date(url: str):
+    """从 The Athletic 文章 URL 提取发布日期：.../2026/07/25/..."""
+    m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", url or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+
+def within_days(url: str, days: int) -> bool:
+    """仅用于测试模式：文章是否在最近 days 天内。解析失败则不过滤。"""
+    if days <= 0:
+        return True
+    d = athletic_date(url)
+    if d is None:
+        return True
+    return (beijing_now().date() - d).days <= days
 
 
 # ---------------------------------------------------------------------------
@@ -243,10 +304,18 @@ def main():
         print("缺少环境变量 BARK_KEY")
         sys.exit(1)
 
-    state = load_state()
-    seen_set = set(state.get("seen", []))
+    TEST_MODE = os.environ.get("TEST_MODE", "") == "1"
+    try:
+        BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "7"))
+    except Exception:
+        BACKFILL_DAYS = 7
 
-    new_items = []  # (key, title, body, url)
+    state = load_state()
+    # 测试模式：忽略已有去重池，重新评估（仍会写回，避免后续重复推送）
+    seen_set = set(state.get("seen", [])) if not TEST_MODE else set()
+    pending = list(state.get("pending", [])) if not TEST_MODE else []
+
+    collected = []  # (key, title, body, url)
 
     # ---- 1) Telegram 频道 ----
     for ch in TG_CHANNELS:
@@ -267,11 +336,11 @@ def main():
         if key in seen_set:
             continue
         if not is_arsenal(text):
-            # 仍计入 seen，避免反复拉取非 Arsenal 消息
-            seen_set.add(key)
+            if not TEST_MODE:
+                seen_set.add(key)
             continue
         src = "Romano" if uname == "fabrizioromano" else "TG聚合"
-        new_items.append((key, f"🔴 Arsenal · {src}", text, extract_url(text)))
+        collected.append((key, f"🔴 Arsenal · {src}", text, extract_url(text)))
         seen_set.add(key)
 
     if updates:
@@ -279,23 +348,85 @@ def main():
 
     # ---- 2) The Athletic (Ornstein) ----
     for title, url in athletic_fetch():
+        if TEST_MODE and not within_days(url, BACKFILL_DAYS):
+            continue
         key = f"athletic:{url}"
         if key in seen_set:
             continue
         if not is_arsenal(title):
-            seen_set.add(key)
+            if not TEST_MODE:
+                seen_set.add(key)
             continue
-        new_items.append((key, "⚪ Arsenal · Ornstein", title, url))
+        collected.append((key, "⚪ Arsenal · Ornstein", title, url))
         seen_set.add(key)
 
-    # ---- 3) 推送 ----
-    for key, title, body, url in new_items:
+    # ---- 3) 静默时段 / 测试模式 决策 ----
+    now_bj = beijing_now()
+    quiet = (not TEST_MODE) and in_quiet_hours(now_bj)
+
+    if quiet:
+        # 静默时段：进入待推送队列，时段结束后补推
+        existing = {p[0] for p in pending}
+        for it in collected:
+            if it[0] not in existing:
+                pending.append(list(it))
+                existing.add(it[0])
+        pending = pending[-PENDING_CAP:]
+        to_push = []
+        note = (
+            f"静默时段({QUIET_START}-{QUIET_END} 北京时间)，"
+            f"{len(collected)} 条进入待推送队列，将于 {QUIET_END} 后统一补推"
+        )
+    else:
+        # 非静默 / 测试：先补推上一静默时段的积压，再推本次新内容
+        to_push = [tuple(p) for p in pending]
+        pending = []
+        to_push.extend(collected)
+        if TEST_MODE:
+            note = f"测试模式：绕过静默时段，推送近 {BACKFILL_DAYS} 天共 {len(to_push)} 条"
+        else:
+            note = (
+                f"正常推送 {len(to_push)} 条"
+                f"（北京时间 {now_bj.strftime('%H:%M')}）"
+            )
+
+    # 去重 to_push
+    seen_push = set()
+    final = []
+    for it in to_push:
+        if it[0] in seen_push:
+            continue
+        seen_push.add(it[0])
+        final.append(it)
+
+    cap = TEST_MAX if TEST_MODE else PUSH_CAP
+    if len(final) > cap:
+        final = final[:cap]
+        note += f"（已达上限 {cap} 条，截断）"
+
+    pushed = 0
+    for key, title, body, url in final:
         code = bark_push(title, body[:400], url)
         print(f"[push] {title} | {body[:50]!r} -> HTTP {code}")
+        pushed += 1
+
+    if TEST_MODE and pushed == 0:
+        # 没有任何真实内容时，发一条回执让 iPhone 确认管道连通
+        bark_push(
+            "✅ 监控测试运行成功",
+            f"近 {BACKFILL_DAYS} 天未匹配到 Arsenal 内容。TG 历史需 bot 在频道内才有；"
+            f"The Athletic 以此为准。管道已连通，无需操作。",
+        )
+        print("[push] 发送测试回执（无匹配内容）")
 
     state["seen"] = list(seen_set)[-2000:]  # 限制体积
+    state["pending"] = pending
     save_state(state)
-    print(f"完成：本次新增 {len(new_items)} 条，历史去重池 {len(seen_set)} 条。")
+    print(note)
+    print(
+        f"完成：本次推送 {pushed} 条，历史去重池 {len(seen_set)} 条，"
+        f"待推送队列 {len(pending)} 条。"
+    )
 
 
 if __name__ == "__main__":

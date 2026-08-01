@@ -37,6 +37,26 @@ Ornstein → Arsenal 聚合 TG 频道 @arsenalbreaking ┘   (双源冗余，更
 - 仓库 → **Actions** → 左侧 `Arsenal Transfer Monitor` → **Run workflow**（手动跑一次测试）。
 - 之后每 15 分钟自动运行。去 iPhone 上看 Bark 是否收到测试期间的 Arsenal 消息。
 
+## 静默时段（免打扰）
+
+默认 **北京时间 23:30 - 次日 08:00** 不推送任何消息。该时段内匹配到的内容会进入「待推送队列」，等 08:00 后下一次运行时统一补推，不会丢失、也不会在深夜打扰你。
+
+- 调整时段：在 Secrets 里加 `QUIET_START` / `QUIET_END`（格式 `HH:MM`，如 `22:00` / `07:30`），不设置则使用默认 23:30 / 08:00。
+- 队列上限 `PENDING_CAP`（默认 80 条），超出只保留最近。
+
+## 测试模式（验证管道）
+
+想验证整条管道是否打通、或补推历史消息时，可在 Actions 页面手动触发并勾选：
+
+- **test_mode（测试模式）**：绕过静默时段、忽略去重池，推送近 N 天匹配到的内容（即便现在是深夜也会推，方便确认链路）。
+- **backfill_days（回溯天数）**：测试模式回溯天数，默认 7。
+
+触发方式二选一：
+1. **Actions 页面**：`Run workflow` → 勾选 test_mode、填 backfill_days → Run。
+2. **API**：`POST /repos/<you>/arsenal-transfer-monitor/actions/workflows/monitor.yml/dispatches`，body `{"ref":"main","inputs":{"test_mode":true,"backfill_days":7}}`。
+
+> 说明：Telegram 历史消息依赖 bot 是否在频道内（bot 加入后才有 `channel_post` 更新），若 bot 未加频道，测试模式下 TG 部分可能为空；The Athletic 文章流不受此限制，是测试的主要可信来源。若近 N 天无匹配内容，会推送一条「测试运行成功」回执，确认 iPhone 能收到。
+
 ## 调参（直接改 `monitor.py` 顶部）
 - `TG_CHANNELS`：监控的 TG 频道列表。
 - `ARSENAL_KEYWORDS`：过滤关键词，含任一才推送（默认 arsenal / #afc / gunners）。
