@@ -1,0 +1,52 @@
+name: Arsenal Transfer Monitor
+
+on:
+  schedule:
+    # 每 15 分钟跑一次（GitHub Actions 定时任务可能延迟数分钟，属正常）
+    # 若仓库为私有(private)：免费额度 2000 分钟/月，15 分钟 ≈ 2880 分钟/月会超额度，
+    # 请把下面改成 '*/30 * * * *'（30 分钟，约 1440 分钟/月，安全在额度内）。
+    # 公开(public)仓库定时任务无限时长，保持 15 分钟即可。
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}   # 允许在 Actions 页面手动触发测试
+
+permissions:
+  contents: read
+  actions: write   # 必须：用于上传/下载去重状态 artifact
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download state artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: monitor-state
+          path: .
+        continue-on-error: true   # 首次运行无 artifact，忽略
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          BARK_SERVER: ${{ secrets.BARK_SERVER }}   # 可选，默认 https://api.day.app
+        run: python monitor.py
+
+      - name: Upload state artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-state
+          path: state.json
+          retention-days: 30
+          if-no-files-found: warn

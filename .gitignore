@@ -1,0 +1,8 @@
+# 状态文件（通过 GitHub Artifact 持久化，不需提交）
+state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
